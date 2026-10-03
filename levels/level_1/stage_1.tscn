@@ -1,0 +1,472 @@
+[gd_scene format=3 uid="uid://lhm7kaby4w0r"]
+
+[ext_resource type="MeshLibrary" uid="uid://bkfhjcx46pwf8" path="res://assets/meshes/forest_library.meshlib" id="1_m15xn"]
+[ext_resource type="MeshLibrary" uid="uid://b5fe0kjosmo7d" path="res://assets/meshes/block_library.meshlib" id="2_8s8sm"]
+[ext_resource type="MeshLibrary" uid="uid://bq7djra5o7euk" path="res://assets/meshes/object_library.meshlib" id="3_cpvyx"]
+[ext_resource type="PackedScene" uid="uid://dmru6t0dtbadh" path="res://player.tscn" id="4_juhly"]
+[ext_resource type="PackedScene" uid="uid://b1x7vmsylqin2" path="res://palm_tree.tscn" id="5_l0tc7"]
+[ext_resource type="PackedScene" path="res://scenes/objects/sea_water.tscn" id="6_8s8sm"]
+
+[sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_m15xn"]
+sky_horizon_color = Color(0.72, 0.85, 0.93, 1)
+ground_bottom_color = Color(0.44, 0.65, 0.84, 1)
+ground_horizon_color = Color(0.56, 0.75, 0.88, 1)
+
+[sub_resource type="Sky" id="Sky_8s8sm"]
+sky_material = SubResource("ProceduralSkyMaterial_m15xn")
+
+[sub_resource type="Environment" id="Environment_ql73s"]
+background_mode = 2
+sky = SubResource("Sky_8s8sm")
+ambient_light_source = 3
+ambient_light_sky_contribution = 0.53
+ambient_light_energy = 0.25
+
+[sub_resource type="Shader" id="Shader_8s8sm"]
+code = "shader_type spatial;
+render_mode cull_back, depth_draw_always;
+
+// Sea surface for topdown pixel art. Four parts:
+//   - 3 Gerstner waves displace the mesh vertices (wave_a/b/c: xy = direction, z = steepness,
+//     w = wavelength)
+//   - depth-based colour via Beer's law: shallow -> color_mid, deep -> color_deep, and where
+//     the water is thinnest at the shore -> white color_foam (reads the depth buffer against
+//     the water surface)
+//   - sparkle streaks: noise stretched along surface_size, pixellated by pixel_size, then
+//     pow + multiply so only the bright peaks survive
+//   - refraction: the depth lookup UV is nudged by noise, making the shoreline ripple over time
+
+uniform float pixel_size = 0.125;
+uniform vec4 color_deep : source_color = vec4(0.384, 0.604, 0.835, 1.0);
+uniform vec4 color_mid : source_color = vec4(0.333, 0.537, 0.827, 1.0);
+uniform vec4 color_foam : source_color = vec4(0.976, 0.996, 1.0, 1.0);
+uniform float beers_law = 1.3;
+uniform float depth_offset = 0.0;
+uniform float refraction = 0.075;
+uniform float foam_amount = 0.04;
+uniform float deep_amount = 0.25;
+// The water glows slightly so it stays readable in a dark scene; set 0 for pure lit water.
+uniform float emission_strength = 0.1;
+
+uniform float wave_speed = 0.5;
+uniform vec4 wave_a = vec4(1.0, 0.4, 0.2, 10.0);
+uniform vec4 wave_b = vec4(-0.4, 0.4, -0.3, 10.0);
+uniform vec4 wave_c = vec4(0.4, -1.0, 0.3, 15.0);
+
+uniform vec2 sampler_scale = vec2(0.25, 0.25);
+uniform vec2 sampler_direction = vec2(0.05, -0.04);
+uniform vec2 uv_sampler_scale = vec2(0.02, 0.02);
+uniform float uv_sampler_strength = 0.04;
+
+uniform vec2 surface_size = vec2(64.0, 4.0);      // streaks stretched ALONG x -> horizontal waves
+uniform vec2 surface_direction = vec2(1.0, 2.0);
+uniform vec2 surface_direction2 = vec2(-1.0, 2.0);
+uniform float surface_exp = 9.0;
+uniform float surface_multiplier = 5.0;
+
+// How many bands the depth gradient is quantised into. Pixel art steps between colours
+// instead of blending (3 = deep / mid / shallow). Raise it for a softer ramp.
+uniform int color_steps = 3;
+
+// filter_nearest: the noise has to come out as BLOCKY SQUARES. Linear filtering makes the
+// water smooth and photoreal, which kills the pixel look.
+uniform sampler2D uv_sampler : filter_nearest, repeat_enable;
+uniform sampler2D noise_sampler : hint_default_black, filter_nearest, repeat_enable;
+uniform sampler2D depth_texture : hint_depth_texture;
+
+varying vec3 v_tangent;
+varying vec3 v_binormal;
+varying vec3 v_normal;
+
+// Gerstner wave, vertical amplitude squashed to 0.25 for a calm sea.
+vec4 wave(vec4 parameter, vec2 position, float time, inout vec3 tangent, inout vec3 binormal) {
+	float wave_steepness = parameter.z;
+	float wave_length = parameter.w;
+	float k = 2.0 * 3.14159265359 / wave_length;
+	float c = sqrt(9.8 / k);
+	vec2 d = normalize(parameter.xy);
+	float f = k * (dot(d, position) - c * time);
+	float a = wave_steepness / k;
+	tangent += normalize(vec3(1.0 - d.x * d.x * (wave_steepness * sin(f)), d.x * (wave_steepness * cos(f)), -d.x * d.y * (wave_steepness * sin(f))));
+	binormal += normalize(vec3(-d.x * d.y * (wave_steepness * sin(f)), d.y * (wave_steepness * cos(f)), 1.0 - d.y * d.y * (wave_steepness * sin(f))));
+	return vec4(d.x * (a * cos(f)), a * sin(f) * 0.25, d.y * (a * cos(f)), 0.0);
+}
+
+// The built-in INV_PROJECTION_MATRIX is not available inside a custom function, so it is
+// passed in from fragment().
+float linearize_depth(mat4 inv_proj, vec2 uv, float depth) {
+	vec3 ndc;
+#if CURRENT_RENDERER == RENDERER_COMPATIBILITY
+	ndc = vec3(uv, depth) * 2.0 - 1.0;
+#else
+	ndc = vec3(uv * 2.0 - 1.0, depth);   // Forward+/Mobile: reversed-Z, z is already in [0,1]
+#endif
+	vec4 view = inv_proj * vec4(ndc, 1.0);
+	view.xyz /= view.w;
+	return -view.z;
+}
+
+vec2 pixellate(vec2 v) {
+	if (pixel_size > 0.0) {
+		v = floor(v / pixel_size) * pixel_size;
+	}
+	return v;
+}
+
+void vertex() {
+	vec4 world_vertex = MODEL_MATRIX * vec4(VERTEX, 1.0);
+	float time = -TIME * wave_speed;
+
+	vec4 v = world_vertex;
+	vec3 vt = vec3(0.0);
+	vec3 vb = vec3(0.0);
+	v += wave(wave_a, world_vertex.xz, time, vt, vb);
+	v += wave(wave_b, world_vertex.xz, time, vt, vb);
+	v += wave(wave_c, world_vertex.xz, time, vt, vb);
+	v_tangent = vt;
+	v_binormal = vb;
+	v_normal = normalize(cross(vb, vt));
+
+	vec4 vertex = inverse(MODEL_MATRIX) * v;
+	TANGENT = v_tangent;
+	BINORMAL = v_binormal;
+	NORMAL = v_normal;
+	VERTEX = vertex.xyz;
+	// UV comes from world xz, so the texture stays seamless wherever the mesh is placed.
+	UV = world_vertex.xz;
+}
+
+float get_surface_flow(vec2 uv, float time) {
+	vec2 uv1 = pixellate(uv + surface_direction * time) / surface_size;
+	// The second layer samples at a scale incommensurate with the first, so the two never fall
+	// into phase. At the same scale the sparkle clusters repeat on a beat and line up in rows.
+	vec2 uv2 = pixellate(uv + surface_direction2 * time) / (surface_size * 0.585) + vec2(0.37, 0.19);
+	float surface = (texture(noise_sampler, uv1).r + texture(noise_sampler, uv2).r) / 2.0;
+	return pow(surface, surface_exp) * surface_multiplier;
+}
+
+void fragment() {
+	float time = TIME * wave_speed;
+	ROUGHNESS = 1.0;   // no specular sheen: a flat, painted-looking surface
+
+	// Every lookup goes through the world-space pixel grid, so even the UV noise snaps to that
+	// grid instead of drifting smoothly like real water.
+	vec2 uv_offset = sampler_direction * time;
+	vec2 base_uv = pixellate(UV);
+	vec2 uv_wobble = uv_sampler_strength * (texture(uv_sampler, base_uv * uv_sampler_scale + uv_offset).rg * 2.0 - 1.0);
+	vec2 uv = base_uv + uv_wobble;
+
+	// Refraction: offset the depth lookup by the noise, so the shoreline ripples (in steps).
+	vec2 ref_uv = SCREEN_UV + uv_wobble * refraction * 20.0;
+	float surface_depth = linearize_depth(INV_PROJECTION_MATRIX, SCREEN_UV, FRAGCOORD.z);
+	float depth_sample = linearize_depth(INV_PROJECTION_MATRIX, SCREEN_UV, texture(depth_texture, ref_uv).r);
+	if (depth_sample <= surface_depth - 1.0) {
+		// the refracted sample landed on something ABOVE the water: use the plain depth instead,
+		// otherwise the object gets a ghost outline
+		depth_sample = linearize_depth(INV_PROJECTION_MATRIX, SCREEN_UV, texture(depth_texture, SCREEN_UV).r);
+	}
+
+	// Beer's law, but POSTERIZED into color_steps discrete bands: a continuous gradient is the
+	// single biggest giveaway that the water is \"real\" in a world made of sprites.
+	float depth_blend = clamp(exp((depth_sample + VERTEX.z + depth_offset) * -beers_law), 0.0, 1.0);
+	float base_brightness = clamp(1.0 - pow(1.0 - depth_blend, 2.5), 0.0, 1.0);
+	float band = clamp(base_brightness / deep_amount, 0.0, 1.0);
+	float steps = float(max(color_steps - 1, 1));
+	band = round(band * steps) / steps;
+	vec4 color = mix(color_deep, color_mid, band);
+
+	// Shore foam: a HARD edge, no soft blend.
+	if (base_brightness >= 1.0 - foam_amount) {
+		color = color_foam;
+	}
+
+	// Sparkle: strictly on/off, giving discrete white pixel clusters instead of a soft bloom.
+	color = mix(color, color_foam, step(0.5, get_surface_flow(uv, time)));
+
+	ALBEDO = color.rgb;
+	EMISSION = color.rgb * emission_strength;
+}
+"
+
+[sub_resource type="FastNoiseLite" id="Noise_streaks"]
+noise_type = 3
+seed = 7
+frequency = 0.06
+
+[sub_resource type="NoiseTexture2D" id="NoiseTex_streaks"]
+noise = SubResource("Noise_streaks")
+seamless = true
+
+[sub_resource type="FastNoiseLite" id="Noise_uv"]
+noise_type = 3
+seed = 23
+
+[sub_resource type="NoiseTexture2D" id="NoiseTex_uv"]
+noise = SubResource("Noise_uv")
+seamless = true
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_cpvyx"]
+render_priority = 20
+shader = SubResource("Shader_8s8sm")
+shader_parameter/pixel_size = 0.125
+shader_parameter/color_deep = Color(0.384, 0.604, 0.835, 1)
+shader_parameter/color_mid = Color(0.333, 0.537, 0.827, 1)
+shader_parameter/color_foam = Color(0.976, 0.996, 1, 1)
+shader_parameter/beers_law = 1.3
+shader_parameter/depth_offset = 0.0
+shader_parameter/refraction = 0.075
+shader_parameter/foam_amount = 0.04
+shader_parameter/deep_amount = 0.25
+shader_parameter/emission_strength = 0.1
+shader_parameter/wave_speed = 0.5
+shader_parameter/wave_a = Vector4(1, 0.4, 0.2, 10)
+shader_parameter/wave_b = Vector4(-0.4, 0.4, -0.3, 10)
+shader_parameter/wave_c = Vector4(0.4, -1, 0.3, 15)
+shader_parameter/sampler_scale = Vector2(0.25, 0.25)
+shader_parameter/sampler_direction = Vector2(0.05, -0.04)
+shader_parameter/uv_sampler_scale = Vector2(0.02, 0.02)
+shader_parameter/uv_sampler_strength = 0.04
+shader_parameter/surface_size = Vector2(64, 4)
+shader_parameter/surface_direction = Vector2(1, 2)
+shader_parameter/surface_direction2 = Vector2(-1, 2)
+shader_parameter/surface_exp = 9.0
+shader_parameter/surface_multiplier = 5.0
+shader_parameter/color_steps = 3
+shader_parameter/uv_sampler = SubResource("NoiseTex_uv")
+shader_parameter/noise_sampler = SubResource("NoiseTex_streaks")
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_juhly"]
+material = SubResource("ShaderMaterial_cpvyx")
+size = Vector2(200, 200)
+subdivide_width = 199
+subdivide_depth = 199
+
+[sub_resource type="Animation" id="Animation_l0tc7"]
+length = 0.001
+tracks/0/type = "value"
+tracks/0/imported = false
+tracks/0/enabled = true
+tracks/0/path = NodePath("OmniLight3D:light_energy")
+tracks/0/interp = 1
+tracks/0/loop_wrap = true
+tracks/0/keys = {
+"times": PackedFloat32Array(0),
+"transitions": PackedFloat32Array(1),
+"update": 0,
+"values": [2.5]
+}
+
+[sub_resource type="Animation" id="Animation_7xf2g"]
+resource_name = "fire"
+length = 0.3
+loop_mode = 1
+tracks/0/type = "value"
+tracks/0/imported = false
+tracks/0/enabled = true
+tracks/0/path = NodePath("OmniLight3D:light_energy")
+tracks/0/interp = 1
+tracks/0/loop_wrap = true
+tracks/0/keys = {
+"times": PackedFloat32Array(0, 0.15, 0.3),
+"transitions": PackedFloat32Array(1, 1, 1),
+"update": 0,
+"values": [2.5, 3.5, 2.5]
+}
+
+[sub_resource type="AnimationLibrary" id="AnimationLibrary_nmkvs"]
+_data = {
+&"RESET": SubResource("Animation_l0tc7"),
+&"fire": SubResource("Animation_7xf2g")
+}
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_8s8sm"]
+top_radius = 0.0
+bottom_radius = 0.25
+height = 0.7
+radial_segments = 5
+
+[sub_resource type="Animation" id="Animation_aov85"]
+length = 0.001
+tracks/0/type = "value"
+tracks/0/imported = false
+tracks/0/enabled = true
+tracks/0/path = NodePath("DirectionalLight3D:rotation")
+tracks/0/interp = 1
+tracks/0/loop_wrap = true
+tracks/0/keys = {
+"times": PackedFloat32Array(0),
+"transitions": PackedFloat32Array(1),
+"update": 0,
+"values": [Vector3(0, -0.61086524, 0)]
+}
+tracks/1/type = "value"
+tracks/1/imported = false
+tracks/1/enabled = true
+tracks/1/path = NodePath("DirectionalLight3D:light_energy")
+tracks/1/interp = 1
+tracks/1/loop_wrap = true
+tracks/1/keys = {
+"times": PackedFloat32Array(0),
+"transitions": PackedFloat32Array(1),
+"update": 0,
+"values": [0.12]
+}
+tracks/2/type = "value"
+tracks/2/imported = false
+tracks/2/enabled = true
+tracks/2/path = NodePath("DirectionalLight3D:light_color")
+tracks/2/interp = 1
+tracks/2/loop_wrap = true
+tracks/2/keys = {
+"times": PackedFloat32Array(0),
+"transitions": PackedFloat32Array(1),
+"update": 0,
+"values": [Color(1, 0.9490196, 0.8509804, 1)]
+}
+tracks/3/type = "value"
+tracks/3/imported = false
+tracks/3/enabled = true
+tracks/3/path = NodePath("WorldEnvironment:environment:ambient_light_energy")
+tracks/3/interp = 1
+tracks/3/loop_wrap = true
+tracks/3/keys = {
+"times": PackedFloat32Array(0),
+"transitions": PackedFloat32Array(1),
+"update": 0,
+"values": [0.25]
+}
+
+[sub_resource type="Animation" id="Animation_66bjg"]
+resource_name = "day_night"
+length = 60.0
+loop_mode = 1
+tracks/0/type = "value"
+tracks/0/imported = false
+tracks/0/enabled = true
+tracks/0/path = NodePath("DirectionalLight3D:rotation")
+tracks/0/interp = 1
+tracks/0/loop_wrap = true
+tracks/0/keys = {
+"times": PackedFloat32Array(0, 15, 30, 45, 60),
+"transitions": PackedFloat32Array(1, 1, 1, 1, 1),
+"update": 0,
+"values": [Vector3(-0.9599311, -0.61086524, 0), Vector3(0, -0.61086524, 0), Vector3(0.9599311, -0.61086524, 0), Vector3(0, -0.61086524, 0), Vector3(-0.9599311, -0.61086524, 0)]
+}
+tracks/1/type = "value"
+tracks/1/imported = false
+tracks/1/enabled = true
+tracks/1/path = NodePath("DirectionalLight3D:light_energy")
+tracks/1/interp = 1
+tracks/1/loop_wrap = true
+tracks/1/keys = {
+"times": PackedFloat32Array(0, 15, 30, 60),
+"transitions": PackedFloat32Array(1, 1, 1, 1),
+"update": 0,
+"values": [0.35, 0.12, 0.0, 0.35]
+}
+tracks/2/type = "value"
+tracks/2/imported = false
+tracks/2/enabled = true
+tracks/2/path = NodePath("DirectionalLight3D:light_color")
+tracks/2/interp = 1
+tracks/2/loop_wrap = true
+tracks/2/keys = {
+"times": PackedFloat32Array(0, 15, 30, 45, 60),
+"transitions": PackedFloat32Array(1, 1, 1, 1, 1),
+"update": 0,
+"values": [Color(1, 0.9490196, 0.8509804, 1), Color(1, 0.5294118, 0.2509804, 1), Color(0.32156864, 0.40392157, 0.5921569, 1), Color(1, 0.6666667, 0.39607844, 1), Color(1, 0.9490196, 0.8509804, 1)]
+}
+tracks/3/type = "value"
+tracks/3/imported = false
+tracks/3/enabled = true
+tracks/3/path = NodePath("WorldEnvironment:environment:ambient_light_energy")
+tracks/3/interp = 1
+tracks/3/loop_wrap = true
+tracks/3/keys = {
+"times": PackedFloat32Array(0, 15, 30, 45, 60),
+"transitions": PackedFloat32Array(1, 1, 1, 1, 1),
+"update": 0,
+"values": [0.72, 0.25, 0.04, 0.25, 0.72]
+}
+
+[sub_resource type="AnimationLibrary" id="AnimationLibrary_y6x6r"]
+_data = {
+&"RESET": SubResource("Animation_aov85"),
+&"day_night": SubResource("Animation_66bjg")
+}
+
+[node name="Stage 1" type="Node3D" unique_id=1339722248]
+
+[node name="World" type="GridMap" parent="." unique_id=182075685]
+mesh_library = ExtResource("1_m15xn")
+cell_center_y = false
+data = {
+"cells": PackedInt32Array(0, 0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4, 0, 0, 5, 0, 0, 6, 1441795, 0, 7, 0, 0, 8, 0, 0, 9, 0, 0, 10, 0, 0, 11, 1441795, 0, 12, 0, 0, 13, 0, 0, 14, 0, 0, 15, 0, 1, 0, 0, 1, 1, 1441794, 1, 2, 0, 1, 3, 0, 1, 5, 1048576, 1, 6, 0, 1, 7, 0, 1, 8, 0, 1, 9, 0, 1, 10, 0, 1, 11, 0, 1, 12, 0, 1, 13, 1441793, 1, 14, 0, 1, 15, 0, 2, 0, 0, 2, 1, 0, 2, 5, 1048576, 2, 6, 1048576, 2, 7, 0, 2, 8, 0, 2, 9, 0, 2, 10, 0, 2, 12, 0, 2, 13, 1441794, 2, 14, 1441793, 2, 15, 0, 3, 0, 0, 3, 3, 1048576, 3, 5, 1441793, 3, 6, 1048576, 3, 7, 0, 3, 8, 1441795, 3, 11, 0, 3, 12, 0, 3, 13, 0, 3, 14, 0, 3, 15, 0, 4, 0, 0, 4, 1, 0, 4, 3, 1048576, 4, 5, 1048576, 4, 6, 1048576, 4, 10, 1048576, 4, 11, 1048576, 4, 12, 1048576, 4, 13, 1048576, 4, 14, 0, 4, 15, 0, 5, 0, 0, 5, 1, 1441795, 5, 2, 0, 5, 3, 1048576, 5, 5, 1048576, 5, 6, 1048576, 5, 8, 1441793, 5, 9, 0, 5, 10, 1048576, 5, 11, 0, 5, 12, 1048576, 5, 13, 1441795, 5, 14, 0, 5, 15, 0, 6, 0, 0, 6, 1, 0, 6, 2, 0, 6, 3, 1048576, 6, 5, 1441795, 6, 6, 655362, 6, 7, 1048576, 6, 8, 0, 6, 9, 1048576, 6, 10, 1048576, 6, 11, 1048576, 6, 12, 1048576, 6, 13, 1441794, 6, 14, 1441793, 6, 15, 0, 7, 0, 0, 7, 1, 0, 7, 2, 0, 7, 3, 0, 7, 6, 1441793, 7, 7, 1048576, 7, 8, 0, 7, 9, 1048576, 7, 12, 0, 7, 13, 0, 7, 14, 0, 7, 15, 0, 8, 0, 0, 8, 1, 0, 8, 2, 0, 8, 5, 0, 8, 6, 0, 8, 7, 1048576, 8, 8, 0, 8, 9, 1048576, 8, 10, 0, 8, 13, 0, 8, 14, 0, 8, 15, 0, 9, 0, 0, 9, 1, 0, 9, 6, 1441793, 9, 7, 1048576, 9, 8, 1048576, 9, 9, 1048576, 9, 10, 0, 9, 11, 0, 9, 12, 0, 9, 15, 0, 10, 0, 0, 10, 6, 1048576, 10, 7, 1048576, 10, 8, 1048576, 10, 9, 1, 10, 10, 1441795, 10, 11, 0, 10, 12, 0, 10, 13, 1441795, 10, 14, 0, 10, 15, 0, 11, 0, 0, 11, 6, 1048576, 11, 9, 1441794, 11, 10, 1441795, 11, 11, 0, 11, 12, 0, 11, 13, 1441794, 11, 14, 0, 11, 15, 0, 12, 0, 0, 12, 6, 1048576, 12, 7, 0, 12, 10, 0, 12, 11, 0, 12, 12, 0, 12, 13, 1441793, 12, 14, 0, 12, 15, 0, 13, 0, 0, 13, 11, 0, 13, 12, 0, 13, 13, 0, 13, 14, 0, 13, 15, 0, 14, 0, 0, 14, 6, 1441793, 14, 7, 1048576, 14, 14, 0, 14, 15, 0, 15, 0, 0, 15, 6, 0, 15, 7, 0, 15, 8, 0, 15, 9, 1048576, 15, 10, 1048576, 15, 11, 0, 15, 12, 0, 15, 13, 0, 15, 14, 0, 15, 15, 0, 13, 6, 1048576, 13, 7, 1048576, 13, 8, 0, 14, 8, 1048576, 14, 9, 1048576, 14, 10, 1441793, 14, 12, 1441795, 14, 13, 0, 6, 4, 1048576, 5, 4, 1048576, 4, 4, 1048576, 2, 4, 1441795, 9, 2, 2, 9, 3, 0, 9, 4, 0, 9, 5, 1441794, 4, 2, 0, 3, 1, 0, 3, 2, 0, 2, 2, 0, 2, 3, 0, 1, 4, 0, 7, 10, 1048576, 7, 11, 0, 8, 11, 0, 8, 12, 0, 9, 13, 0, 9, 14, 0, 8, 3, 0, 8, 4, 0, 7, 4, 0, 7, 5, 1048576, 5, 7, 1048576, 4, 7, 1048576, 4, 8, 1441794, 4, 9, 0, 3, 9, 0, 3, 10, 0, 2, 11, 0, 11, 7, 1048576, 11, 8, 1048576, 12, 8, 0, 12, 9, 0, 13, 9, 0, 13, 10, 0, 14, 11, 1441794, 3, 4, 1441794, 1, 65535, 655389, 2, 65535, 655389, 4, 65535, 655389, 5, 65535, 655389, 3, 65535, 655389, 6, 65535, 655389, 7, 65535, 655389, 8, 65535, 655389, 9, 65535, 655389, 10, 65535, 655389, 11, 65535, 655389, 12, 65535, 655389, 13, 65535, 655389, 14, 65535, 655389, 2, 16, 29, 3, 16, 29, 4, 16, 29, 5, 16, 29, 6, 16, 29, 7, 16, 29, 8, 16, 29, 9, 16, 29, 10, 16, 29, 11, 16, 29, 12, 16, 29, 13, 16, 29, 14, 16, 29, 65535, 2, 1441821, 65535, 3, 1441821, 65535, 4, 1441821, 65535, 5, 1441821, 65535, 6, 1441821, 65535, 7, 1441821, 65535, 8, 1441821, 65535, 9, 1441821, 65535, 10, 1441821, 65535, 11, 1441821, 65535, 12, 1441821, 65535, 13, 1441821, 65535, 14, 1441821, 65535, 65535, 655390, 65535, 16, 1441822, 65535, 1, 1441821, 0, 65535, 655389, 65535, 0, 1441821, 65535, 15, 1441821, 1, 16, 29, 0, 16, 29, 15, 16, 29, 16, 16, 30, 15, 65535, 655389, 16, 65535, 1048606, 16, 0, 1048605, 16, 1, 1048605, 16, 2, 1048605, 16, 3, 1048605, 16, 4, 1048605, 16, 5, 1048605, 16, 6, 1048605, 16, 7, 1048605, 16, 8, 1048605, 16, 9, 1048605, 16, 10, 1048605, 16, 11, 1048605, 16, 12, 1048605, 16, 13, 1048605, 16, 14, 1048605, 16, 15, 1048605, 15, 1, 0, 15, 2, 0, 15, 3, 0, 15, 4, 0, 15, 5, 1048576, 65546, 1, 1441792, 65546, 2, 1441792, 65546, 3, 1441792, 65546, 4, 1441792, 65546, 5, 1441792, 65547, 1, 1441792, 65547, 2, 1441792, 65547, 3, 1441792, 65547, 4, 1441792, 65547, 5, 1441792, 65548, 1, 1441792, 65548, 2, 1441792, 65548, 3, 1441792, 65548, 4, 1441792, 65548, 5, 1441792, 65549, 1, 1441792, 65549, 2, 1441792, 65549, 3, 1441792, 65549, 4, 1441792, 65549, 5, 1441792, 10, 1, 196608, 10, 2, 589825, 10, 3, 196608, 10, 4, 196608, 10, 5, 196608, 11, 1, 196608, 11, 2, 196608, 11, 3, 196608, 11, 4, 196608, 11, 5, 196608, 12, 1, 196608, 12, 2, 196608, 12, 3, 196608, 12, 4, 196608, 12, 5, 196608, 13, 1, 196608, 13, 2, 196608, 13, 3, 196608, 13, 4, 196608, 13, 5, 196608, 14, 1, 196608, 14, 2, 196608, 14, 3, 1376258, 14, 4, 196608, 14, 5, 1245184, 65547, 6, 16, 65548, 6, 17, 65549, 6, 26, 65546, 6, 26, 65545, 2, 1441818, 65545, 3, 1441818, 65545, 4, 1441818, 65545, 5, 1441818, 65545, 1, 1441818, 65546, 0, 655386, 65547, 0, 655386, 65548, 0, 655386, 65549, 0, 655386, 65545, 0, 655387, 65545, 6, 1441819, 65550, 0, 1048603, 65550, 1, 1048602, 65550, 2, 1048602, 65550, 3, 1048602, 65550, 4, 1048602, 65550, 5, 1048602, 65550, 6, 27)
+}
+metadata/_editor_floor_ = Vector3(0, 1, 0)
+
+[node name="Block" type="GridMap" parent="." unique_id=238297137]
+mesh_library = ExtResource("2_8s8sm")
+cell_center_y = false
+data = {
+"cells": PackedInt32Array(10, 1, 1441792, 10, 2, 1441792, 10, 3, 1441792, 10, 4, 1441792, 10, 5, 1441792, 11, 1, 1441792, 11, 2, 1441792, 11, 3, 1441792, 11, 4, 1441792, 11, 5, 1441792, 12, 1, 1441792, 12, 2, 1441792, 12, 3, 1441792, 12, 4, 1441792, 12, 5, 1441792, 13, 1, 1441792, 13, 2, 1441792, 13, 3, 1441792, 13, 4, 1441792, 13, 5, 1441792, 14, 1, 1441792, 14, 2, 1441792, 14, 3, 1441792, 14, 4, 1441792, 14, 5, 1441792, 131078, 12, 1048576, 131083, 10, 1048576, 131076, 7, 1048576, 131074, 4, 1048576, 131079, 3, 1048576)
+}
+metadata/_editor_floor_ = Vector3(0, 2, 0)
+
+[node name="Object" type="GridMap" parent="." unique_id=358723443]
+mesh_library = ExtResource("3_cpvyx")
+cell_center_y = false
+data = {
+"cells": PackedInt32Array(4, 10, 1048576, 1, 5, 1048576, 15, 9, 1048576, 14, 14, 1048576, 2, 15, 1048576, 11, 11, 1048576, 5, 2, 1048576, 15, 3, 1048576, 8, 9, 1048576)
+}
+metadata/_editor_floor_ = Vector3(0, 0, 0)
+
+[node name="Player" parent="." unique_id=927789831 instance=ExtResource("4_juhly")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 9.02, 4, 10.018)
+
+[node name="PalmTree" parent="." unique_id=1860321724 instance=ExtResource("5_l0tc7")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 14.272855, 1, 11.197872)
+
+[node name="PalmTree4" parent="." unique_id=35168395 instance=ExtResource("5_l0tc7")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 25.433275, 3, 5.231882)
+
+[node name="PalmTree2" parent="." unique_id=1647871740 instance=ExtResource("5_l0tc7")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3.4217625, 1, 20.897903)
+
+[node name="PalmTree3" parent="." unique_id=903144172 instance=ExtResource("5_l0tc7")]
+transform = Transform3D(0.999972, -0.0037314296, 0.006488822, 0.003711142, 0.9999882, 0.0031346667, -0.0065004467, -0.003110489, 0.999974, 20.086094, 1, 29.726017)
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=613480946]
+transform = Transform3D(0.81915206, 0, -0.57357645, 0, 1, 0, 0.57357645, 0, 0.81915206, 0, 0, 0)
+light_color = Color(1, 0.9490196, 0.8509804, 1)
+light_energy = 0.12
+shadow_enabled = true
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=1744724768]
+environment = SubResource("Environment_ql73s")
+
+[node name="SeaWater" parent="." unique_id=1035918336 instance=ExtResource("6_8s8sm")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 16.016224, -2.9773016, 15.975958)
+mesh = SubResource("PlaneMesh_juhly")
+
+[node name="CampFire" type="Node3D" parent="." unique_id=556996204]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 13.441, 0, 18.141)
+
+[node name="OmniLight3D" type="OmniLight3D" parent="CampFire" unique_id=492157041]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2, 0)
+light_color = Color(1, 0.60784316, 0.27450982, 1)
+light_energy = 2.5
+shadow_enabled = true
+omni_range = 6.0
+
+[node name="AnimationPlayer" type="AnimationPlayer" parent="CampFire" unique_id=851785618]
+libraries/ = SubResource("AnimationLibrary_nmkvs")
+autoplay = &"fire"
+
+[node name="Flame" type="MeshInstance3D" parent="CampFire" unique_id=839443457]
+transform = Transform3D(0.25, 0, 0, 0, 0.25, 0, 0, 0, 0.25, 0, 2, 0)
+mesh = SubResource("CylinderMesh_8s8sm")
+
+[node name="Day&NightPlayer" type="AnimationPlayer" parent="." unique_id=1782631831]
+libraries/ = SubResource("AnimationLibrary_y6x6r")
+autoplay = &"day_night"

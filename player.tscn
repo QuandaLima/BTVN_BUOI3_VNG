@@ -1,0 +1,60 @@
+[gd_scene format=3 uid="uid://dmru6t0dtbadh"]
+
+[ext_resource type="Script" uid="uid://chg0evcp15ksk" path="res://scenes/player/player.gd" id="1_1jxqw"]
+[ext_resource type="Texture2D" uid="uid://cwkkl08airpta" path="res://assets/foxy/fox_hat/foxy_hat_sprite_sheet.png" id="2_dw050"]
+[ext_resource type="AnimationLibrary" uid="uid://bxn6hb7ky7gfi" path="res://scenes/player/player_anims.tres" id="3_b26j0"]
+[ext_resource type="Script" uid="uid://bytwgpxy1wbb3" path="res://scenes/player/states/idle.gd" id="4_n7ghd"]
+[ext_resource type="Script" uid="uid://kx1fr4p8vy0f" path="res://scenes/player/states/run.gd" id="5_nvl01"]
+[ext_resource type="Script" uid="uid://dpcr7kcoh7xdh" path="res://scenes/player/states/jump.gd" id="6_ivps1"]
+[ext_resource type="Script" uid="uid://cqn00yvsknulb" path="res://scenes/player/states/fall.gd" id="7_urp6f"]
+[ext_resource type="Script" uid="uid://cuuuns47usqkv" path="res://wall_cling.gd" id="8_b26j0"]
+[ext_resource type="Script" uid="uid://digmujqpijppn" path="res://wall_jump.gd" id="9_n7ghd"]
+
+[sub_resource type="CapsuleShape3D" id="CapsuleShape3D_m301a"]
+
+[node name="Player" type="CharacterBody3D" unique_id=927789831]
+script = ExtResource("1_1jxqw")
+metadata/_custom_type_script = "uid://clw03abs2j8ss"
+
+[node name="Sprite3D" type="Sprite3D" parent="." unique_id=43197314]
+offset = Vector2(0, 22)
+pixel_size = 0.0625
+billboard = 1
+shaded = true
+alpha_cut = 1
+texture_filter = 0
+texture = ExtResource("2_dw050")
+hframes = 4
+vframes = 15
+frame = 16
+
+[node name="AnimationPlayer" type="AnimationPlayer" parent="." unique_id=409102505]
+libraries/ = ExtResource("3_b26j0")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=1995562196]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0)
+shape = SubResource("CapsuleShape3D_m301a")
+
+[node name="States" type="Node" parent="." unique_id=305856589]
+
+[node name="Idle" type="Node" parent="States" unique_id=1087591207]
+script = ExtResource("4_n7ghd")
+
+[node name="Run" type="Node" parent="States" unique_id=26818081]
+script = ExtResource("5_nvl01")
+
+[node name="Jump" type="Node" parent="States" unique_id=1012252979]
+script = ExtResource("6_ivps1")
+
+[node name="Fall" type="Node" parent="States" unique_id=1823129574]
+script = ExtResource("7_urp6f")
+
+[node name="WallCling" type="Node" parent="States" unique_id=1649689831]
+script = ExtResource("8_b26j0")
+
+[node name="WallJump" type="Node" parent="States" unique_id=905778266]
+script = ExtResource("9_n7ghd")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=1412551522]
+transform = Transform3D(1, 0, 0, 0, 0.70710677, 0.70710677, 0, -0.70710677, 0.70710677, 0, 30, 30)
+fov = 30.0

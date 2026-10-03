@@ -1,0 +1,6 @@
+# Godot cache
+.godot/
+
+# Windows temporary files
+Thumbs.db
+Desktop.ini
